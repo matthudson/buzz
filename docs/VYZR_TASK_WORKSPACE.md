@@ -19,6 +19,8 @@ The configuration has this closed shape:
   "schemaVersion": "buzz-vyzr-workspaces.v1",
   "workspaces": [
     {
+      "relayOrigin": "https://exact-community-relay.example",
+      "channelId": "exact-project-channel-id",
       "repoAddress": "30617:<owner>:<repository>",
       "projectId": "project-id",
       "principalId": "buzz-desktop",
@@ -27,12 +29,15 @@ The configuration has this closed shape:
       "runtimeRoot": "C:\\absolute\\clean-vyzr-runtime",
       "runtimeRevision": "<full-commit-sha>",
       "runtimeScriptSha256": "<sha256-of-development-mcp.mjs>",
+      "runtimeTreeSha256": "<bounded-tree-digest-excluding-.git>",
       "repositoryPath": "C:\\absolute\\project-checkout",
       "stateDir": "C:\\absolute\\existing-vyzr-state",
       "envelopePath": "C:\\absolute\\project-envelope.json",
       "envelopeDigest": "<approved-envelope-digest>",
       "codexExecutable": "C:\\absolute\\codex.exe",
+      "codexSha256": "<sha256>",
       "devinExecutable": "C:\\absolute\\devin.exe",
+      "devinSha256": "<sha256>",
       "defaultChecks": ["repository"],
       "defaultWorker": "swe-2-direct",
       "defaultReviewer": "codex-sol",
@@ -42,12 +47,19 @@ The configuration has this closed shape:
 }
 ```
 
-The bridge selects an exact repository mapping, validates and canonicalizes its
-executable/runtime paths, binds the envelope's project, principal, and runtime
-revision, and launches the pinned VYZR MCP from that approved runtime. The
-configuration digest is fixed for the child lifetime; drift requires an app
-restart rather than silently changing authority. The UI may request source
-scope, but VYZR's server-owned envelope makes the acceptance decision.
+The bridge selects an exact relay, channel, and repository mapping, validates
+and canonicalizes its executable/runtime paths, binds the canonical envelope
+digest and the envelope's project, principal, and runtime revision, and
+launches the pinned VYZR MCP from that approved runtime. The bounded runtime
+tree digest covers every ordinary file below the runtime root except `.git`;
+symlinks, special files, more than 10,000 files, or more than 512 MiB fail
+closed. Files are sorted by relative path and hashed as repeated UTF-8
+forward-slash path, NUL, decimal byte length, NUL, and exact file bytes. Node,
+Codex, and Devin are separately bound by SHA-256. Validation is
+repeated immediately before process creation. The configuration digest is
+fixed for the child lifetime; drift requires an app restart rather than
+silently changing authority. The UI may request source scope, but VYZR's
+server-owned envelope makes the acceptance decision.
 
 If Buzz exits while an admitted execution is active, closing MCP input makes
 the existing VYZR driver stop accepting work, wait for its already-admitted
@@ -56,10 +68,15 @@ kill that controller subprocess on drop: doing so could strand a provider child
 or turn a known execution into an ambiguous effect. The controller remains the
 durable source of truth when Buzz is opened again.
 
-Buzz uses the immutable Nostr task event ID as the VYZR submission correlation.
-Submission is idempotent, and the resulting VYZR task ID is deterministic. The
-task detail polls only while work is active. Recommendation bytes are bounded
-and verified against their digest and byte count before display.
+Buzz binds the immutable Nostr task event ID to its exact relay, project
+channel, and repository coordinate before deriving VYZR submission
+correlation. Submission is idempotent, and the resulting VYZR task ID is
+deterministic. Tool errors and non-exact admission receipts are rejected.
+Transport or framing failures evict the affected cached client; fixed polling
+stops on an error instead of consuming an unbounded retry loop. The task detail
+polls only while work is active. Recommendation bytes are bounded and verified
+against their digest and byte count before display. When no bridge config is
+present, the task workspace renders nothing.
 
 This is an attended, same-user integration boundary. It does not establish
 hostile same-user containment, automatic deployment, live installation, or

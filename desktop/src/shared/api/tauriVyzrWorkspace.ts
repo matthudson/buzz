@@ -44,6 +44,8 @@ export type VyzrRecommendationArtifact = {
 export type VyzrTaskWorkspaceProjection = {
   schemaVersion: "buzz-vyzr-task-workspace.v1";
   repoAddress: string;
+  relayOrigin: string;
+  channelId: string;
   taskId: string;
   requestedWorker: string;
   requestedReviewer: string;
@@ -54,18 +56,35 @@ export type VyzrTaskWorkspaceProjection = {
   recommendation: VyzrRecommendationArtifact | null;
 };
 
+export type VyzrWorkspaceKey = {
+  relayOrigin: string;
+  channelId: string;
+  repoAddress: string;
+};
+
+export function isVyzrWorkspaceAvailable(
+  key: VyzrWorkspaceKey,
+): Promise<{ configured: boolean }> {
+  return invokeTauri("is_vyzr_workspace_available", key);
+}
+
 export function getVyzrProjectTask(
-  repoAddress: string,
+  key: VyzrWorkspaceKey,
+  issueRepoAddress: string,
   issueId: string,
 ): Promise<VyzrTaskWorkspaceProjection> {
   return invokeTauri<VyzrTaskWorkspaceProjection>("get_vyzr_project_task", {
-    repoAddress,
+    ...key,
+    issueRepoAddress,
     issueId,
   });
 }
 
 export function submitVyzrProjectTask(input: {
+  relayOrigin: string;
+  channelId: string;
   repoAddress: string;
+  issueRepoAddress: string;
   issueId: string;
   title: string;
   objective: string;
@@ -76,6 +95,11 @@ export function submitVyzrProjectTask(input: {
   taskId: string;
   state: string;
   envelopeDigest: string;
+  resourcePlan: {
+    maxProviderExecutions: number;
+    correctionReserve: number;
+    independentReview: "exact_artifact_separate_session";
+  };
   executionDriver: "scheduled" | "active" | "terminal";
 }> {
   return invokeTauri("submit_vyzr_project_task", { input });

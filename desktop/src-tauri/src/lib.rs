@@ -590,6 +590,7 @@ pub fn run() {
             merge_project_pull_request,
             open_project_terminal,
             open_project_merge_recovery_terminal,
+            is_vyzr_workspace_available,
             get_vyzr_project_task,
             submit_vyzr_project_task,
             search_users,

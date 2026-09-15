@@ -385,7 +385,11 @@ export function ProjectIssueDetail({
           <ProjectRichContent content={issue.content} tags={issue.tags} />
         </ProjectDetailSection>
       ) : null}
-      <VyzrTaskWorkspacePanel issue={issue} project={project} />
+      <VyzrTaskWorkspacePanel
+        issue={issue}
+        key={`${project.repoAddress}:${issue.channelId ?? "unknown"}:${issue.id}`}
+        project={project}
+      />
       <ProjectDetailSection defaultOpen title="Activity">
         <div className="space-y-3">
           <DiscussedInChannels

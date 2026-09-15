@@ -7,11 +7,15 @@ import type { ProjectIssue, Repository } from "@/features/projects/hooks";
 import {
   decodeVyzrRecommendation,
   parseVyzrScopes,
+  shouldPollVyzrProjection,
+  vyzrWorkspaceQueryKey,
 } from "@/features/projects/vyzrWorkspace";
 import {
   getVyzrProjectTask,
+  isVyzrWorkspaceAvailable,
   submitVyzrProjectTask,
 } from "@/shared/api/tauriVyzrWorkspace";
+import { useRelayOrigin } from "@/shared/lib/useRelayOrigin";
 import { Button } from "@/shared/ui/button";
 import { Input } from "@/shared/ui/input";
 import {
@@ -19,12 +23,6 @@ import {
   ProjectDetailMetaRow,
 } from "./ProjectDetailMeta";
 import { ProjectDetailSection } from "./ProjectDetailSection";
-
-const queryKey = (repoAddress: string, issueId: string) => [
-  "vyzr-task-workspace",
-  repoAddress,
-  issueId,
-];
 
 function errorMessage(error: unknown): string {
   const message = error instanceof Error ? error.message : String(error);
@@ -59,9 +57,13 @@ function Recommendation({
         SHA-256 {artifact.digest}
       </p>
       {decoded.error ? (
-        <p className="mt-2 text-destructive">{errorMessage(decoded.error)}</p>
+        <p aria-live="polite" className="mt-2 text-destructive">
+          {errorMessage(decoded.error)}
+        </p>
       ) : decoded.isLoading ? (
-        <p className="mt-2 text-muted-foreground">Verifying exact bytes…</p>
+        <p aria-live="polite" className="mt-2 text-muted-foreground">
+          Verifying exact bytes…
+        </p>
       ) : (
         <pre className="mt-2 max-h-64 overflow-auto whitespace-pre-wrap break-words rounded-md bg-background/60 p-3 font-mono text-3xs">
           {JSON.stringify(decoded.data, null, 2)}
@@ -79,34 +81,58 @@ export function VyzrTaskWorkspacePanel({
   project: Repository;
 }) {
   const queryClient = useQueryClient();
+  const relayOrigin = useRelayOrigin();
+  const channelId = issue.channelId ?? "";
+  const issueRepoAddress = issue.repoAddress ?? "";
+  const workspaceKey = React.useMemo(
+    () => ({
+      relayOrigin: relayOrigin ?? "",
+      channelId,
+      repoAddress: project.repoAddress,
+    }),
+    [channelId, project.repoAddress, relayOrigin],
+  );
   const [scopeInput, setScopeInput] = React.useState("");
+  const scopeResetKey = `${relayOrigin ?? ""}\n${channelId}\n${project.repoAddress}\n${issue.id}`;
+  React.useEffect(() => {
+    if (scopeResetKey) setScopeInput("");
+  }, [scopeResetKey]);
+  const availability = useQuery({
+    queryKey: [
+      "vyzr-workspace-availability",
+      workspaceKey.relayOrigin,
+      workspaceKey.channelId,
+      workspaceKey.repoAddress,
+    ],
+    queryFn: () => isVyzrWorkspaceAvailable(workspaceKey),
+    enabled: Boolean(
+      relayOrigin && channelId && issueRepoAddress === project.repoAddress,
+    ),
+    retry: false,
+    staleTime: Number.POSITIVE_INFINITY,
+  });
   const projection = useQuery({
-    queryKey: queryKey(project.repoAddress, issue.id),
-    queryFn: () => getVyzrProjectTask(project.repoAddress, issue.id),
+    queryKey: vyzrWorkspaceQueryKey(workspaceKey, issue.id),
+    queryFn: () => getVyzrProjectTask(workspaceKey, issueRepoAddress, issue.id),
+    enabled: availability.data?.configured === true,
     refetchInterval: (query) =>
-      query.state.data?.task &&
-      ![
-        "recommended",
-        "needs_inspection",
-        "cancelled",
-        "integration_source_observed",
-      ].includes(query.state.data.task.state)
+      shouldPollVyzrProjection(query.state.data, Boolean(query.state.error))
         ? 5_000
         : false,
     retry: false,
   });
+  type Submission = Parameters<typeof submitVyzrProjectTask>[0];
   const submit = useMutation({
-    mutationFn: async () =>
-      submitVyzrProjectTask({
-        repoAddress: project.repoAddress,
-        issueId: issue.id,
-        title: issue.title,
-        objective: issue.content.trim() || issue.title,
-        scopes: parseVyzrScopes(scopeInput),
-      }),
-    onSuccess: async () => {
+    mutationFn: async (submission: Submission) =>
+      submitVyzrProjectTask(submission),
+    onSuccess: async (_receipt, submission) => {
+      const submittedKey = {
+        relayOrigin: submission.relayOrigin,
+        channelId: submission.channelId,
+        repoAddress: submission.repoAddress,
+      };
       await queryClient.invalidateQueries({
-        queryKey: queryKey(project.repoAddress, issue.id),
+        queryKey: vyzrWorkspaceQueryKey(submittedKey, submission.issueId),
       });
       toast.success(
         "VYZR accepted the task inside the approved project envelope.",
@@ -121,10 +147,30 @@ export function VyzrTaskWorkspacePanel({
     },
   });
 
+  if (!relayOrigin || !channelId || issueRepoAddress !== project.repoAddress) {
+    return null;
+  }
+  if (availability.isLoading || availability.data?.configured === false) {
+    return null;
+  }
+  if (availability.error) {
+    return (
+      <ProjectDetailSection defaultOpen title="VYZR delivery">
+        <div
+          aria-live="polite"
+          className="flex gap-2 text-sm text-muted-foreground"
+        >
+          <CircleAlert aria-hidden="true" className="mt-0.5 h-4 w-4 shrink-0" />
+          <span>{errorMessage(availability.error)}</span>
+        </div>
+      </ProjectDetailSection>
+    );
+  }
+
   if (projection.isLoading) {
     return (
       <ProjectDetailSection defaultOpen title="VYZR delivery">
-        <p className="text-sm text-muted-foreground">
+        <p aria-live="polite" className="text-sm text-muted-foreground">
           Loading deterministic controller state…
         </p>
       </ProjectDetailSection>
@@ -136,8 +182,9 @@ export function VyzrTaskWorkspacePanel({
         <div
           className="flex gap-2 text-sm text-muted-foreground"
           data-testid="vyzr-workspace-unavailable"
+          aria-live="polite"
         >
-          <CircleAlert className="mt-0.5 h-4 w-4 shrink-0" />
+          <CircleAlert aria-hidden="true" className="mt-0.5 h-4 w-4 shrink-0" />
           <span>{errorMessage(projection.error)}</span>
         </div>
       </ProjectDetailSection>
@@ -174,7 +221,16 @@ export function VyzrTaskWorkspacePanel({
           <Button
             data-testid="vyzr-workspace-submit"
             disabled={submit.isPending || scopeInput.trim().length === 0}
-            onClick={() => submit.mutate()}
+            onClick={() =>
+              submit.mutate({
+                ...workspaceKey,
+                issueRepoAddress,
+                issueId: issue.id,
+                title: issue.title,
+                objective: issue.content.trim() || issue.title,
+                scopes: parseVyzrScopes(scopeInput),
+              })
+            }
             type="button"
           >
             {submit.isPending ? "Submitting…" : "Start with VYZR"}

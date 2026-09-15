@@ -14,8 +14,8 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::Stdio;
 use tauri::State;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 use tokio::time::{timeout, Duration};
 
@@ -23,7 +23,10 @@ const CONFIG_ENV: &str = "BUZZ_VYZR_WORKSPACE_CONFIG";
 const MAX_CONFIG_BYTES: u64 = 64 * 1024;
 const MAX_RPC_BYTES: usize = 512 * 1024;
 const RPC_TIMEOUT: Duration = Duration::from_secs(15);
+const MAX_RUNTIME_FILES: usize = 10_000;
+const MAX_RUNTIME_BYTES: u64 = 512 * 1024 * 1024;
 
+/// Process-local cache of validated VYZR MCP connections.
 #[derive(Default)]
 pub struct VyzrWorkspaceState {
     clients: Mutex<HashMap<String, VyzrMcpClient>>,
@@ -39,6 +42,8 @@ struct WorkspaceConfigFile {
 #[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct WorkspaceConfig {
+    relay_origin: String,
+    channel_id: String,
     repo_address: String,
     project_id: String,
     principal_id: String,
@@ -47,16 +52,128 @@ struct WorkspaceConfig {
     runtime_root: String,
     runtime_revision: String,
     runtime_script_sha256: String,
+    runtime_tree_sha256: String,
     repository_path: String,
     state_dir: String,
     envelope_path: String,
     envelope_digest: String,
     codex_executable: String,
+    codex_sha256: String,
     devin_executable: String,
+    devin_sha256: String,
     default_checks: Vec<String>,
     default_worker: String,
     default_reviewer: String,
     data_class: String,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ProjectEnvelope {
+    schema_version: String,
+    project_id: String,
+    principal_id: String,
+    revision: String,
+    repository_digest: String,
+    store_identity_digest: String,
+    expires_at: String,
+    allowed_scopes: Vec<String>,
+    allowed_checks: Vec<String>,
+    allowed_bindings: Vec<String>,
+    data_classes: Vec<String>,
+    resource_plan: ResourcePlan,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ResourcePlan {
+    max_provider_executions: u8,
+    correction_reserve: u8,
+    independent_review: String,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct OperatorOwner {
+    kind: String,
+    id: String,
+    label: String,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct OperatorBlocker {
+    code: String,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct LastVerifiedUpdate {
+    sequence: u64,
+    revision: u64,
+    kind: String,
+    observed_at: String,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct OperatorTask {
+    schema_version: String,
+    task_id: String,
+    title: Option<String>,
+    state: String,
+    owner: OperatorOwner,
+    next_step: String,
+    blockers: Vec<OperatorBlocker>,
+    required_decision: Option<String>,
+    last_verified_update: LastVerifiedUpdate,
+    evidence_path: String,
+    artifact_path: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct OperatorView {
+    schema_version: String,
+    tasks: Vec<OperatorTask>,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ControllerEvent {
+    sequence: u64,
+    revision: u64,
+    kind: String,
+    observed_at: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct EventPage {
+    schema_version: String,
+    task_id: String,
+    events: Vec<ControllerEvent>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ToolTextContent {
+    r#type: String,
+    text: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ToolCallResult {
+    content: Vec<ToolTextContent>,
+    structured_content: Value,
+    is_error: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VyzrWorkspaceAvailability {
+    configured: bool,
 }
 
 #[derive(Serialize)]
@@ -64,30 +181,54 @@ struct WorkspaceConfig {
 pub struct VyzrWorkspaceProjection {
     schema_version: &'static str,
     repo_address: String,
+    relay_origin: String,
+    channel_id: String,
     task_id: String,
     requested_worker: String,
     requested_reviewer: String,
     requested_checks: Vec<String>,
     data_class: String,
-    task: Option<Value>,
-    events: Vec<Value>,
+    task: Option<OperatorTask>,
+    events: Vec<ControllerEvent>,
     recommendation: Option<Value>,
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SubmitVyzrProjectTaskInput {
+    relay_origin: String,
+    channel_id: String,
     repo_address: String,
+    issue_repo_address: String,
     issue_id: String,
     title: String,
     objective: String,
     scopes: Vec<String>,
 }
 
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SubmissionReceipt {
+    schema_version: String,
+    outcome: String,
+    task_id: String,
+    state: String,
+    envelope_digest: String,
+    resource_plan: ResourcePlan,
+    execution_driver: String,
+}
+
+type McpReader = BufReader<Box<dyn AsyncRead + Send + Unpin>>;
+type McpWriter = Box<dyn AsyncWrite + Send + Unpin>;
+
 struct VyzrMcpClient {
     _child: Child,
-    stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
+    transport: McpTransport,
+}
+
+struct McpTransport {
+    stdin: McpWriter,
+    stdout: McpReader,
     next_id: u64,
     config_digest: String,
 }
@@ -109,6 +250,79 @@ fn sha256_file(path: &Path) -> Result<String, String> {
             break;
         }
         hasher.update(&buffer[..count]);
+    }
+    Ok(hex::encode(hasher.finalize()))
+}
+
+fn collect_runtime_files(
+    root: &Path,
+    directory: &Path,
+    files: &mut Vec<PathBuf>,
+) -> Result<(), String> {
+    let mut entries = std::fs::read_dir(directory)
+        .map_err(|_| "vyzr_workspace_runtime_unavailable".to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| "vyzr_workspace_runtime_unavailable".to_string())?;
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        let path = entry.path();
+        let relative = path
+            .strip_prefix(root)
+            .map_err(|_| "vyzr_workspace_runtime_unsafe".to_string())?;
+        if relative
+            .components()
+            .next()
+            .is_some_and(|part| part.as_os_str() == ".git")
+        {
+            continue;
+        }
+        let metadata = std::fs::symlink_metadata(&path)
+            .map_err(|_| "vyzr_workspace_runtime_unavailable".to_string())?;
+        if metadata.file_type().is_symlink() {
+            return Err("vyzr_workspace_runtime_unsafe".to_string());
+        }
+        if metadata.is_dir() {
+            collect_runtime_files(root, &path, files)?;
+        } else if metadata.is_file() {
+            files.push(path);
+            if files.len() > MAX_RUNTIME_FILES {
+                return Err("vyzr_workspace_runtime_unsafe".to_string());
+            }
+        } else {
+            return Err("vyzr_workspace_runtime_unsafe".to_string());
+        }
+    }
+    Ok(())
+}
+
+fn runtime_tree_digest(root: &Path) -> Result<String, String> {
+    let mut files = Vec::new();
+    collect_runtime_files(root, root, &mut files)?;
+    let mut total = 0_u64;
+    let mut hasher = Sha256::new();
+    for path in files {
+        let relative = path
+            .strip_prefix(root)
+            .map_err(|_| "vyzr_workspace_runtime_unsafe".to_string())?
+            .to_str()
+            .ok_or_else(|| "vyzr_workspace_runtime_unsafe".to_string())?
+            .replace('\\', "/");
+        let metadata = std::fs::metadata(&path)
+            .map_err(|_| "vyzr_workspace_runtime_unavailable".to_string())?;
+        total = total
+            .checked_add(metadata.len())
+            .filter(|value| *value <= MAX_RUNTIME_BYTES)
+            .ok_or_else(|| "vyzr_workspace_runtime_unsafe".to_string())?;
+        let bytes =
+            std::fs::read(&path).map_err(|_| "vyzr_workspace_runtime_unavailable".to_string())?;
+        if bytes.len() as u64 != metadata.len() {
+            return Err("vyzr_workspace_runtime_changed".to_string());
+        }
+        hasher.update(relative.as_bytes());
+        hasher.update([0]);
+        hasher.update(bytes.len().to_string().as_bytes());
+        hasher.update([0]);
+        hasher.update(bytes);
     }
     Ok(hex::encode(hasher.finalize()))
 }
@@ -160,13 +374,18 @@ fn validate_workspace(mut config: WorkspaceConfig) -> Result<WorkspaceConfig, St
         .iter()
         .collect::<std::collections::HashSet<_>>()
         .len();
-    if !safe_line(&config.repo_address, 1024)
+    if !safe_line(&config.relay_origin, 2048)
+        || !safe_identifier(&config.channel_id, 128)
+        || !safe_line(&config.repo_address, 1024)
         || !safe_identifier(&config.project_id, 128)
         || !safe_identifier(&config.principal_id, 101)
         || !is_hex(&config.node_sha256, 64)
         || !is_hex(&config.runtime_revision, 40)
         || !is_hex(&config.runtime_script_sha256, 64)
+        || !is_hex(&config.runtime_tree_sha256, 64)
         || !is_hex(&config.envelope_digest, 64)
+        || !is_hex(&config.codex_sha256, 64)
+        || !is_hex(&config.devin_sha256, 64)
         || !matches!(
             config.default_worker.as_str(),
             "codex-spark" | "codex-sol" | "swe-2" | "swe-2-direct"
@@ -203,23 +422,28 @@ fn validate_workspace(mut config: WorkspaceConfig) -> Result<WorkspaceConfig, St
     if sha256_file(&script)? != config.runtime_script_sha256 {
         return Err("vyzr_workspace_runtime_integrity_mismatch".to_string());
     }
+    if runtime_tree_digest(&runtime)? != config.runtime_tree_sha256 {
+        return Err("vyzr_workspace_runtime_integrity_mismatch".to_string());
+    }
     let repository = absolute_existing(&config.repository_path, true)?;
     let state = absolute_existing(&config.state_dir, true)?;
     let envelope = absolute_existing(&config.envelope_path, false)?;
     let codex = absolute_existing(&config.codex_executable, false)?;
     let devin = absolute_existing(&config.devin_executable, false)?;
-    let envelope_value: Value = serde_json::from_slice(
+    if sha256_file(&codex)? != config.codex_sha256 || sha256_file(&devin)? != config.devin_sha256 {
+        return Err("vyzr_workspace_provider_integrity_mismatch".to_string());
+    }
+    let envelope_value: ProjectEnvelope = serde_json::from_slice(
         &std::fs::read(&envelope).map_err(|_| "vyzr_workspace_envelope_unavailable".to_string())?,
     )
     .map_err(|_| "vyzr_workspace_envelope_invalid".to_string())?;
-    if envelope_value.get("schemaVersion").and_then(Value::as_str)
-        != Some("development-project-envelope.v1")
-        || envelope_value.get("projectId").and_then(Value::as_str)
-            != Some(config.project_id.as_str())
-        || envelope_value.get("principalId").and_then(Value::as_str)
-            != Some(config.principal_id.as_str())
-        || envelope_value.get("revision").and_then(Value::as_str)
-            != Some(config.runtime_revision.as_str())
+    let canonical_envelope = serde_json::to_vec(&envelope_value)
+        .map_err(|_| "vyzr_workspace_envelope_invalid".to_string())?;
+    if sha256_bytes(&canonical_envelope) != config.envelope_digest
+        || envelope_value.schema_version != "development-project-envelope.v1"
+        || envelope_value.project_id != config.project_id
+        || envelope_value.principal_id != config.principal_id
+        || envelope_value.revision != config.runtime_revision
     {
         return Err("vyzr_workspace_envelope_binding_mismatch".to_string());
     }
@@ -233,8 +457,15 @@ fn validate_workspace(mut config: WorkspaceConfig) -> Result<WorkspaceConfig, St
     Ok(config)
 }
 
-fn load_workspace(repo_address: &str) -> Result<(WorkspaceConfig, String), String> {
-    if !safe_line(repo_address, 1024) {
+fn load_workspace(
+    relay_origin: &str,
+    channel_id: &str,
+    repo_address: &str,
+) -> Result<(WorkspaceConfig, String), String> {
+    if !safe_line(relay_origin, 2048)
+        || !safe_identifier(channel_id, 128)
+        || !safe_line(repo_address, 1024)
+    {
         return Err("vyzr_workspace_repo_address_invalid".to_string());
     }
     let path =
@@ -261,24 +492,45 @@ fn load_workspace(repo_address: &str) -> Result<(WorkspaceConfig, String), Strin
     let matches: Vec<_> = parsed
         .workspaces
         .into_iter()
-        .filter(|workspace| workspace.repo_address == repo_address)
+        .filter(|workspace| {
+            workspace.relay_origin == relay_origin
+                && workspace.channel_id == channel_id
+                && workspace.repo_address == repo_address
+        })
         .collect();
     if matches.len() != 1 {
         return Err("vyzr_workspace_mapping_unavailable".to_string());
     }
-    let workspace = validate_workspace(matches.into_iter().next().expect("one mapping"))?;
+    let workspace = matches
+        .into_iter()
+        .next()
+        .ok_or_else(|| "vyzr_workspace_mapping_unavailable".to_string())?;
+    let workspace = validate_workspace(workspace)?;
     Ok((workspace, sha256_bytes(&bytes)))
 }
 
-fn issue_submission_id(issue_id: &str) -> Result<String, String> {
+fn issue_submission_id(
+    relay_origin: &str,
+    channel_id: &str,
+    repo_address: &str,
+    issue_id: &str,
+) -> Result<String, String> {
     if !is_hex(issue_id, 64) {
         return Err("vyzr_workspace_issue_id_invalid".to_string());
     }
-    Ok(format!("buzz-{issue_id}"))
+    let digest = sha256_bytes(
+        format!("{relay_origin}\n{channel_id}\n{repo_address}\n{issue_id}").as_bytes(),
+    );
+    Ok(format!("buzz-{digest}"))
 }
 
 fn task_id(config: &WorkspaceConfig, issue_id: &str) -> Result<String, String> {
-    let submission = issue_submission_id(issue_id)?;
+    let submission = issue_submission_id(
+        &config.relay_origin,
+        &config.channel_id,
+        &config.repo_address,
+        issue_id,
+    )?;
     let input = format!(
         "{}\n{}\n{}",
         config.principal_id, config.project_id, submission
@@ -330,7 +582,76 @@ fn validate_recommendation_artifact(value: Value, expected_task_id: &str) -> Res
     Ok(value)
 }
 
-async fn read_bounded_line(reader: &mut BufReader<ChildStdout>) -> Result<Vec<u8>, String> {
+fn valid_stage(value: &str) -> bool {
+    matches!(
+        value,
+        "starting"
+            | "implementing"
+            | "correcting"
+            | "reviewing"
+            | "reviewed"
+            | "rehearsed"
+            | "recommended"
+            | "needs_inspection"
+            | "integration_source_observed"
+            | "cancelled"
+    )
+}
+
+fn validate_operator_task(task: &OperatorTask) -> Result<(), String> {
+    let task_digest = task.task_id.strip_prefix("dev-");
+    if task.schema_version != "development-operator-status.v1"
+        || !task_digest.is_some_and(|value| is_hex(value, 64))
+        || !valid_stage(&task.state)
+        || !matches!(
+            task.owner.kind.as_str(),
+            "attended_lead" | "implementation_worker" | "independent_reviewer"
+        )
+        || !safe_identifier(&task.owner.id, 128)
+        || !safe_line(&task.owner.label, 256)
+        || !safe_line(&task.next_step, 1024)
+        || task
+            .title
+            .as_ref()
+            .is_some_and(|value| !safe_line(value, 256))
+        || task.blockers.len() > 64
+        || task
+            .blockers
+            .iter()
+            .any(|blocker| !safe_identifier(&blocker.code, 128))
+        || task
+            .required_decision
+            .as_ref()
+            .is_some_and(|value| !safe_identifier(value, 128))
+        || task.last_verified_update.sequence == 0
+        || task.last_verified_update.revision == 0
+        || !safe_identifier(&task.last_verified_update.kind, 128)
+        || !safe_line(&task.last_verified_update.observed_at, 64)
+        || !safe_line(&task.evidence_path, 4096)
+        || task
+            .artifact_path
+            .as_ref()
+            .is_some_and(|value| !safe_line(value, 4096))
+    {
+        return Err("vyzr_workspace_projection_invalid".to_string());
+    }
+    Ok(())
+}
+
+fn validate_controller_event(event: &ControllerEvent) -> Result<(), String> {
+    if event.sequence == 0
+        || event.revision == 0
+        || !safe_identifier(&event.kind, 128)
+        || !safe_line(&event.observed_at, 64)
+    {
+        return Err("vyzr_workspace_events_invalid".to_string());
+    }
+    Ok(())
+}
+
+async fn read_bounded_line<R: AsyncRead + Unpin>(
+    reader: &mut BufReader<R>,
+) -> Result<Vec<u8>, String> {
     let mut result = Vec::new();
     loop {
         let available = reader
@@ -373,13 +694,15 @@ impl VyzrMcpClient {
             .ok_or_else(|| "vyzr_workspace_spawn_failed".to_string())?;
         let mut client = Self {
             _child: child,
-            stdin,
-            stdout: BufReader::new(stdout),
-            next_id: 1,
-            config_digest,
+            transport: McpTransport {
+                stdin: Box::new(stdin),
+                stdout: BufReader::new(Box::new(stdout)),
+                next_id: 1,
+                config_digest,
+            },
         };
         let initialized = client
-            .request("initialize", json!({
+            .transport.request("initialize", json!({
                 "protocolVersion": "2025-06-18",
                 "capabilities": {},
                 "clientInfo": { "name": "buzz-task-workspace", "version": env!("CARGO_PKG_VERSION") }
@@ -391,11 +714,14 @@ impl VyzrMcpClient {
             return Err("vyzr_workspace_protocol_mismatch".to_string());
         }
         client
+            .transport
             .notify("notifications/initialized", json!({}))
             .await?;
         Ok(client)
     }
+}
 
+impl McpTransport {
     async fn write_value(&mut self, value: &Value) -> Result<(), String> {
         let mut bytes =
             serde_json::to_vec(value).map_err(|_| "vyzr_workspace_request_invalid".to_string())?;
@@ -414,11 +740,21 @@ impl VyzrMcpClient {
     }
 
     async fn notify(&mut self, method: &str, params: Value) -> Result<(), String> {
-        self.write_value(&json!({ "jsonrpc": "2.0", "method": method, "params": params }))
-            .await
+        timeout(
+            RPC_TIMEOUT,
+            self.write_value(&json!({ "jsonrpc": "2.0", "method": method, "params": params })),
+        )
+        .await
+        .map_err(|_| "vyzr_workspace_transport_timeout".to_string())?
     }
 
     async fn request(&mut self, method: &str, params: Value) -> Result<Value, String> {
+        timeout(RPC_TIMEOUT, self.request_inner(method, params))
+            .await
+            .map_err(|_| "vyzr_workspace_transport_timeout".to_string())?
+    }
+
+    async fn request_inner(&mut self, method: &str, params: Value) -> Result<Value, String> {
         let id = self.next_id;
         self.next_id = self
             .next_id
@@ -428,9 +764,7 @@ impl VyzrMcpClient {
             &json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }),
         )
         .await?;
-        let bytes = timeout(RPC_TIMEOUT, read_bounded_line(&mut self.stdout))
-            .await
-            .map_err(|_| "vyzr_workspace_transport_timeout".to_string())??;
+        let bytes = read_bounded_line(&mut self.stdout).await?;
         let response: Value = serde_json::from_slice(&bytes)
             .map_err(|_| "vyzr_workspace_response_invalid".to_string())?;
         if response.get("jsonrpc") != Some(&Value::String("2.0".to_string()))
@@ -454,14 +788,34 @@ impl VyzrMcpClient {
                 json!({ "name": name, "arguments": arguments }),
             )
             .await?;
-        response
-            .pointer("/result/structuredContent")
-            .cloned()
-            .ok_or_else(|| "vyzr_workspace_tool_result_invalid".to_string())
+        let result: ToolCallResult = serde_json::from_value(
+            response
+                .get("result")
+                .cloned()
+                .ok_or_else(|| "vyzr_workspace_tool_result_invalid".to_string())?,
+        )
+        .map_err(|_| "vyzr_workspace_tool_result_invalid".to_string())?;
+        if result.is_error {
+            return Err("vyzr_workspace_tool_failed".to_string());
+        }
+        if result.content.len() != 1
+            || result.content[0].r#type != "text"
+            || result.content[0].text.len() > MAX_RPC_BYTES
+            || serde_json::from_str::<Value>(&result.content[0].text).ok()
+                != Some(result.structured_content.clone())
+        {
+            return Err("vyzr_workspace_tool_result_invalid".to_string());
+        }
+        Ok(result.structured_content)
     }
 }
 
 fn build_mcp_command(config: &WorkspaceConfig) -> Result<Command, String> {
+    let config = validate_workspace(config.clone())?;
+    build_validated_mcp_command(&config)
+}
+
+fn build_validated_mcp_command(config: &WorkspaceConfig) -> Result<Command, String> {
     let runtime = absolute_existing(&config.runtime_root, true)?;
     let script = runtime.join("scripts/orchestrator/development-mcp.mjs");
     let mut command = Command::new(&config.node_executable);
@@ -494,6 +848,8 @@ fn build_mcp_command(config: &WorkspaceConfig) -> Result<Command, String> {
 
 async fn with_client<T, F>(
     state: &VyzrWorkspaceState,
+    relay_origin: &str,
+    channel_id: &str,
     repo_address: &str,
     operation: F,
 ) -> Result<T, String>
@@ -504,97 +860,174 @@ where
         WorkspaceConfig,
     ) -> Pin<Box<dyn Future<Output = Result<T, String>> + Send + 'a>>,
 {
-    let (config, config_digest) = load_workspace(repo_address)?;
+    let (config, config_digest) = load_workspace(relay_origin, channel_id, repo_address)?;
+    let client_key = format!("{relay_origin}\n{channel_id}\n{repo_address}");
     let mut clients = state.clients.lock().await;
-    if let Some(existing) = clients.get(repo_address) {
-        if existing.config_digest != config_digest {
+    if let Some(existing) = clients.get(&client_key) {
+        if existing.transport.config_digest != config_digest {
             return Err("vyzr_workspace_configuration_changed_restart_required".to_string());
         }
     } else {
         let client = VyzrMcpClient::launch(&config, config_digest).await?;
-        clients.insert(repo_address.to_string(), client);
+        clients.insert(client_key.clone(), client);
     }
-    let client = clients.get_mut(repo_address).expect("client inserted");
-    operation(client, config).await
+    let result = match clients.get_mut(&client_key) {
+        Some(client) => operation(client, config).await,
+        None => Err("vyzr_workspace_client_unavailable".to_string()),
+    };
+    if result.is_err() {
+        clients.remove(&client_key);
+    }
+    result
 }
 
+/// Reports whether an exact relay/channel/repository mapping is configured.
+#[tauri::command]
+pub async fn is_vyzr_workspace_available(
+    relay_origin: String,
+    channel_id: String,
+    repo_address: String,
+) -> Result<VyzrWorkspaceAvailability, String> {
+    if std::env::var_os(CONFIG_ENV).is_none() {
+        return Ok(VyzrWorkspaceAvailability { configured: false });
+    }
+    load_workspace(&relay_origin, &channel_id, &repo_address)?;
+    Ok(VyzrWorkspaceAvailability { configured: true })
+}
+
+/// Reads one exact task projection from the configured VYZR controller.
 #[tauri::command]
 pub async fn get_vyzr_project_task(
+    relay_origin: String,
+    channel_id: String,
     repo_address: String,
+    issue_repo_address: String,
     issue_id: String,
     state: State<'_, VyzrWorkspaceState>,
 ) -> Result<VyzrWorkspaceProjection, String> {
-    with_client(&state, &repo_address, |client, config| {
-        Box::pin(async move {
-            let expected_task_id = task_id(&config, &issue_id)?;
-            let view = client.tool("development_tasks", json!({})).await?;
-            let tasks = view
-                .get("tasks")
-                .and_then(Value::as_array)
-                .ok_or_else(|| "vyzr_workspace_projection_invalid".to_string())?;
-            let task = tasks
-                .iter()
-                .find(|item| {
-                    item.get("taskId").and_then(Value::as_str) == Some(expected_task_id.as_str())
-                })
-                .cloned();
-            let mut events = Vec::new();
-            let mut recommendation = None;
-            if let Some(ref current) = task {
-                let last_sequence = current
-                    .pointer("/lastVerifiedUpdate/sequence")
-                    .and_then(Value::as_u64)
-                    .ok_or_else(|| "vyzr_workspace_projection_invalid".to_string())?;
-                let page = client
-                    .tool(
-                        "development_events",
-                        json!({
-                            "taskId": expected_task_id,
-                            "afterSequence": last_sequence.saturating_sub(8),
-                            "limit": 8
-                        }),
-                    )
-                    .await?;
-                events = page
-                    .get("events")
-                    .and_then(Value::as_array)
-                    .cloned()
-                    .ok_or_else(|| "vyzr_workspace_events_invalid".to_string())?;
-                if current.get("state").and_then(Value::as_str) == Some("recommended") {
-                    let artifact = client
-                        .tool(
-                            "development_artifact",
-                            json!({ "taskId": expected_task_id, "kind": "recommendation" }),
-                        )
-                        .await?;
-                    recommendation = Some(validate_recommendation_artifact(
-                        artifact,
-                        &expected_task_id,
-                    )?);
+    if issue_repo_address != repo_address {
+        return Err("vyzr_workspace_issue_repository_mismatch".to_string());
+    }
+    with_client(
+        &state,
+        &relay_origin,
+        &channel_id,
+        &repo_address,
+        |client, config| {
+            Box::pin(async move {
+                let expected_task_id = task_id(&config, &issue_id)?;
+                let view: OperatorView = serde_json::from_value(
+                    client
+                        .transport
+                        .tool("development_tasks", json!({}))
+                        .await?,
+                )
+                .map_err(|_| "vyzr_workspace_projection_invalid".to_string())?;
+                if view.schema_version != "development-operator-view.v1" {
+                    return Err("vyzr_workspace_projection_invalid".to_string());
                 }
-            }
-            Ok(VyzrWorkspaceProjection {
-                schema_version: "buzz-vyzr-task-workspace.v1",
-                repo_address: config.repo_address,
-                task_id: expected_task_id,
-                requested_worker: config.default_worker,
-                requested_reviewer: config.default_reviewer,
-                requested_checks: config.default_checks,
-                data_class: config.data_class,
-                task,
-                events,
-                recommendation,
+                for task in &view.tasks {
+                    validate_operator_task(task)?;
+                }
+                let task = view
+                    .tasks
+                    .iter()
+                    .find(|item| item.task_id == expected_task_id)
+                    .cloned();
+                let mut events = Vec::new();
+                let mut recommendation = None;
+                if let Some(ref current) = task {
+                    let last_sequence = current.last_verified_update.sequence;
+                    let page: EventPage = serde_json::from_value(
+                        client
+                            .transport
+                            .tool(
+                                "development_events",
+                                json!({
+                                    "taskId": expected_task_id,
+                                    "afterSequence": last_sequence.saturating_sub(8),
+                                    "limit": 8
+                                }),
+                            )
+                            .await?,
+                    )
+                    .map_err(|_| "vyzr_workspace_events_invalid".to_string())?;
+                    if page.schema_version != "development-event-page.v1"
+                        || page.task_id != expected_task_id
+                        || page.events.len() > 8
+                    {
+                        return Err("vyzr_workspace_events_invalid".to_string());
+                    }
+                    for event in &page.events {
+                        validate_controller_event(event)?;
+                    }
+                    events = page.events;
+                    if current.state == "recommended" {
+                        let artifact = client
+                            .transport
+                            .tool(
+                                "development_artifact",
+                                json!({ "taskId": expected_task_id, "kind": "recommendation" }),
+                            )
+                            .await?;
+                        recommendation = Some(validate_recommendation_artifact(
+                            artifact,
+                            &expected_task_id,
+                        )?);
+                    }
+                }
+                Ok(VyzrWorkspaceProjection {
+                    schema_version: "buzz-vyzr-task-workspace.v1",
+                    repo_address: config.repo_address,
+                    relay_origin: config.relay_origin,
+                    channel_id: config.channel_id,
+                    task_id: expected_task_id,
+                    requested_worker: config.default_worker,
+                    requested_reviewer: config.default_reviewer,
+                    requested_checks: config.default_checks,
+                    data_class: config.data_class,
+                    task,
+                    events,
+                    recommendation,
+                })
             })
-        })
-    })
+        },
+    )
     .await
 }
 
+fn validate_submission_receipt(
+    value: Value,
+    expected_task_id: &str,
+    expected_envelope_digest: &str,
+) -> Result<SubmissionReceipt, String> {
+    let receipt: SubmissionReceipt = serde_json::from_value(value)
+        .map_err(|_| "vyzr_workspace_submission_receipt_invalid".to_string())?;
+    if receipt.schema_version != "development-task-submission-receipt.v1"
+        || receipt.outcome != "accepted_or_replayed"
+        || receipt.task_id != expected_task_id
+        || receipt.envelope_digest != expected_envelope_digest
+        || !matches!(
+            receipt.execution_driver.as_str(),
+            "scheduled" | "active" | "terminal"
+        )
+        || !safe_identifier(&receipt.state, 64)
+        || receipt.resource_plan.max_provider_executions < 2
+        || receipt.resource_plan.max_provider_executions > 16
+        || receipt.resource_plan.correction_reserve > 3
+        || receipt.resource_plan.independent_review != "exact_artifact_separate_session"
+    {
+        return Err("vyzr_workspace_submission_receipt_invalid".to_string());
+    }
+    Ok(receipt)
+}
+
+/// Submits one idempotent task request to the configured VYZR controller.
 #[tauri::command]
 pub async fn submit_vyzr_project_task(
     input: SubmitVyzrProjectTaskInput,
     state: State<'_, VyzrWorkspaceState>,
-) -> Result<Value, String> {
+) -> Result<SubmissionReceipt, String> {
     if !safe_line(&input.title, 256)
         || input.objective.len() > 16_000
         || input.objective.chars().any(|ch| ch == '\0')
@@ -604,33 +1037,53 @@ pub async fn submit_vyzr_project_task(
     {
         return Err("vyzr_workspace_submission_invalid".to_string());
     }
+    if input.issue_repo_address != input.repo_address {
+        return Err("vyzr_workspace_issue_repository_mismatch".to_string());
+    }
     let repo_address = input.repo_address.clone();
-    with_client(&state, &repo_address, |client, config| {
-        Box::pin(async move {
-            let submission_id = issue_submission_id(&input.issue_id)?;
-            client
-                .tool(
-                    "development_submit",
-                    json!({
-                        "schemaVersion": "development-task-submission.v1",
-                        "submissionId": submission_id,
-                        "envelopeDigest": config.envelope_digest,
-                        "spec": {
-                            "schemaVersion": "development-task-spec.v1",
-                            "title": input.title,
-                            "objective": input.objective,
-                            "scopes": input.scopes,
-                            "checks": config.default_checks,
-                            "dependencies": [],
-                            "dataClass": config.data_class,
-                            "worker": config.default_worker,
-                            "reviewer": config.default_reviewer
-                        }
-                    }),
-                )
-                .await
-        })
-    })
+    let relay_origin = input.relay_origin.clone();
+    let channel_id = input.channel_id.clone();
+    with_client(
+        &state,
+        &relay_origin,
+        &channel_id,
+        &repo_address,
+        |client, config| {
+            Box::pin(async move {
+                let submission_id = issue_submission_id(
+                    &input.relay_origin,
+                    &input.channel_id,
+                    &input.repo_address,
+                    &input.issue_id,
+                )?;
+                let expected_task_id = task_id(&config, &input.issue_id)?;
+                let expected_envelope_digest = config.envelope_digest.clone();
+                let result = client
+                    .transport
+                    .tool(
+                        "development_submit",
+                        json!({
+                            "schemaVersion": "development-task-submission.v1",
+                            "submissionId": submission_id,
+                            "envelopeDigest": config.envelope_digest,
+                            "spec": {
+                                "schemaVersion": "development-task-spec.v1",
+                                "title": input.title,
+                                "objective": input.objective,
+                                "scopes": input.scopes,
+                                "checks": config.default_checks,
+                                "dependencies": [],
+                                "dataClass": config.data_class,
+                                "worker": config.default_worker,
+                                "reviewer": config.default_reviewer
+                            }
+                        }),
+                    )
+                    .await?;
+                validate_submission_receipt(result, &expected_task_id, &expected_envelope_digest)
+            })
+        },
+    )
     .await
 }
 
@@ -640,6 +1093,8 @@ mod tests {
 
     fn test_config() -> WorkspaceConfig {
         WorkspaceConfig {
+            relay_origin: "https://relay.example".into(),
+            channel_id: "science-simulations".into(),
             repo_address: "30617:owner:repo".into(),
             project_id: "hudstone".into(),
             principal_id: "buzz-desktop".into(),
@@ -648,12 +1103,15 @@ mod tests {
             runtime_root: "C:\\vyzr".into(),
             runtime_revision: "b".repeat(40),
             runtime_script_sha256: "c".repeat(64),
+            runtime_tree_sha256: "d".repeat(64),
             repository_path: "C:\\repo".into(),
             state_dir: "C:\\state".into(),
             envelope_path: "C:\\envelope.json".into(),
-            envelope_digest: "d".repeat(64),
+            envelope_digest: "e".repeat(64),
             codex_executable: "C:\\codex.exe".into(),
+            codex_sha256: "f".repeat(64),
             devin_executable: "C:\\devin.exe".into(),
+            devin_sha256: "0".repeat(64),
             default_checks: vec!["docs".into()],
             default_worker: "swe-2-direct".into(),
             default_reviewer: "codex-sol".into(),
@@ -665,7 +1123,15 @@ mod tests {
     fn derives_stable_task_identity_from_buzz_issue() {
         let config = test_config();
         let issue = "1".repeat(64);
-        let expected = sha256_bytes(format!("buzz-desktop\nhudstone\nbuzz-{issue}").as_bytes());
+        let submission_digest = sha256_bytes(
+            format!(
+                "{}\n{}\n{}\n{issue}",
+                config.relay_origin, config.channel_id, config.repo_address
+            )
+            .as_bytes(),
+        );
+        let expected =
+            sha256_bytes(format!("buzz-desktop\nhudstone\nbuzz-{submission_digest}").as_bytes());
         assert_eq!(task_id(&config, &issue).unwrap(), format!("dev-{expected}"));
         assert_eq!(
             task_id(&config, &issue).unwrap(),
@@ -675,7 +1141,7 @@ mod tests {
 
     #[test]
     fn rejects_non_event_issue_identity_and_unsafe_lines() {
-        assert!(issue_submission_id("../../task").is_err());
+        assert!(issue_submission_id("relay", "channel", "repo", "../../task").is_err());
         assert!(!safe_line("line\n--worker", 256));
         assert!(!safe_line("line\u{2028}next", 256));
     }
@@ -707,7 +1173,7 @@ mod tests {
         let runtime = directory.path().canonicalize().unwrap();
         let mut config = test_config();
         config.runtime_root = runtime.to_string_lossy().into_owned();
-        let command = build_mcp_command(&config).unwrap();
+        let command = build_validated_mcp_command(&config).unwrap();
         let command = command.as_std();
         let args = command
             .get_args()
@@ -744,5 +1210,193 @@ mod tests {
                 config.devin_executable,
             ]
         );
+    }
+
+    fn valid_receipt(config: &WorkspaceConfig, task: &str) -> Value {
+        json!({
+            "schemaVersion": "development-task-submission-receipt.v1",
+            "outcome": "accepted_or_replayed",
+            "taskId": task,
+            "state": "implementing",
+            "envelopeDigest": config.envelope_digest,
+            "resourcePlan": {
+                "maxProviderExecutions": 4,
+                "correctionReserve": 1,
+                "independentReview": "exact_artifact_separate_session"
+            },
+            "executionDriver": "scheduled"
+        })
+    }
+
+    #[test]
+    fn submission_receipt_requires_exact_authority_bindings() {
+        let config = test_config();
+        let task = format!("dev-{}", "1".repeat(64));
+        assert!(validate_submission_receipt(
+            valid_receipt(&config, &task),
+            &task,
+            &config.envelope_digest,
+        )
+        .is_ok());
+        let mut wrong = valid_receipt(&config, &task);
+        wrong["taskId"] = Value::String(format!("dev-{}", "2".repeat(64)));
+        assert!(validate_submission_receipt(wrong, &task, &config.envelope_digest).is_err());
+        let mut unexpected = valid_receipt(&config, &task);
+        unexpected["observedModel"] = Value::String("untrusted".into());
+        assert!(validate_submission_receipt(unexpected, &task, &config.envelope_digest).is_err());
+    }
+
+    #[test]
+    fn runtime_tree_digest_is_stable_and_detects_dependency_drift() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(directory.path().join("scripts/orchestrator")).unwrap();
+        std::fs::write(
+            directory
+                .path()
+                .join("scripts/orchestrator/development-mcp.mjs"),
+            b"import './store.mjs';\n",
+        )
+        .unwrap();
+        std::fs::write(
+            directory.path().join("scripts/orchestrator/store.mjs"),
+            b"export const value = 1;\n",
+        )
+        .unwrap();
+        let first = runtime_tree_digest(directory.path()).unwrap();
+        assert_eq!(first, runtime_tree_digest(directory.path()).unwrap());
+        std::fs::write(
+            directory.path().join("scripts/orchestrator/store.mjs"),
+            b"export const value = 2;\n",
+        )
+        .unwrap();
+        assert_ne!(first, runtime_tree_digest(directory.path()).unwrap());
+    }
+
+    fn test_transport() -> (McpTransport, tokio::io::DuplexStream) {
+        let (client, server) = tokio::io::duplex(16 * 1024);
+        let (reader, writer) = tokio::io::split(client);
+        (
+            McpTransport {
+                stdin: Box::new(writer),
+                stdout: BufReader::new(Box::new(reader)),
+                next_id: 1,
+                config_digest: "config".into(),
+            },
+            server,
+        )
+    }
+
+    #[tokio::test]
+    async fn tool_rejects_mcp_error_even_with_structured_content() {
+        let (mut transport, server) = test_transport();
+        let (reader, mut writer) = tokio::io::split(server);
+        let mut reader = BufReader::new(reader);
+        let server_task = tokio::spawn(async move {
+            let mut request = String::new();
+            reader.read_line(&mut request).await.unwrap();
+            let response = json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "content": [{ "type": "text", "text": "{\"outcome\":\"accepted_or_replayed\"}" }],
+                    "structuredContent": { "outcome": "accepted_or_replayed" },
+                    "isError": true
+                }
+            });
+            writer
+                .write_all(&serde_json::to_vec(&response).unwrap())
+                .await
+                .unwrap();
+            writer.write_all(b"\n").await.unwrap();
+        });
+        assert_eq!(
+            transport
+                .tool("development_submit", json!({}))
+                .await
+                .unwrap_err(),
+            "vyzr_workspace_tool_failed"
+        );
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn tool_rejects_content_that_does_not_match_structured_content() {
+        let (mut transport, server) = test_transport();
+        let (reader, mut writer) = tokio::io::split(server);
+        let mut reader = BufReader::new(reader);
+        let server_task = tokio::spawn(async move {
+            let mut request = String::new();
+            reader.read_line(&mut request).await.unwrap();
+            let response = json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "content": [{ "type": "text", "text": "{\"outcome\":\"different\"}" }],
+                    "structuredContent": { "outcome": "accepted_or_replayed" },
+                    "isError": false
+                }
+            });
+            writer
+                .write_all(&serde_json::to_vec(&response).unwrap())
+                .await
+                .unwrap();
+            writer.write_all(b"\n").await.unwrap();
+        });
+        assert_eq!(
+            transport
+                .tool("development_submit", json!({}))
+                .await
+                .unwrap_err(),
+            "vyzr_workspace_tool_result_invalid"
+        );
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn transport_rejects_an_oversized_response_before_parsing() {
+        let (mut transport, server) = test_transport();
+        let (reader, mut writer) = tokio::io::split(server);
+        let mut reader = BufReader::new(reader);
+        let server_task = tokio::spawn(async move {
+            let mut request = String::new();
+            reader.read_line(&mut request).await.unwrap();
+            writer
+                .write_all(&vec![b'x'; MAX_RPC_BYTES + 1])
+                .await
+                .unwrap();
+            writer.write_all(b"\n").await.unwrap();
+        });
+        assert_eq!(
+            transport
+                .request("development_tasks", json!({}))
+                .await
+                .unwrap_err(),
+            "vyzr_workspace_response_too_large"
+        );
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn transport_rejects_stale_response_identity() {
+        let (mut transport, server) = test_transport();
+        let (reader, mut writer) = tokio::io::split(server);
+        let mut reader = BufReader::new(reader);
+        let server_task = tokio::spawn(async move {
+            let mut request = String::new();
+            reader.read_line(&mut request).await.unwrap();
+            writer
+                .write_all(br#"{"jsonrpc":"2.0","id":99,"result":{}}"#)
+                .await
+                .unwrap();
+            writer.write_all(b"\n").await.unwrap();
+        });
+        assert_eq!(
+            transport
+                .request("development_tasks", json!({}))
+                .await
+                .unwrap_err(),
+            "vyzr_workspace_response_mismatch"
+        );
+        server_task.await.unwrap();
     }
 }

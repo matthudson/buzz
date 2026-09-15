@@ -1,7 +1,37 @@
-import type { VyzrRecommendationArtifact } from "@/shared/api/tauriVyzrWorkspace";
+import type {
+  VyzrRecommendationArtifact,
+  VyzrTaskWorkspaceProjection,
+  VyzrWorkspaceKey,
+} from "@/shared/api/tauriVyzrWorkspace";
 
 const SCOPE_PATTERN =
   /^(?!\.git(?:\/|$))(?!\/)(?!.*(?:^|\/)\.\.(?:\/|$))[A-Za-z0-9._ -]+(?:\/[A-Za-z0-9._ -]+)*$/;
+
+const TERMINAL_STATES = new Set([
+  "recommended",
+  "needs_inspection",
+  "cancelled",
+  "integration_source_observed",
+]);
+
+export function vyzrWorkspaceQueryKey(key: VyzrWorkspaceKey, issueId: string) {
+  return [
+    "vyzr-task-workspace",
+    key.relayOrigin,
+    key.channelId,
+    key.repoAddress,
+    issueId,
+  ] as const;
+}
+
+export function shouldPollVyzrProjection(
+  projection: VyzrTaskWorkspaceProjection | undefined,
+  failed: boolean,
+): boolean {
+  return Boolean(
+    !failed && projection?.task && !TERMINAL_STATES.has(projection.task.state),
+  );
+}
 
 export function parseVyzrScopes(value: string): string[] {
   const scopes = value

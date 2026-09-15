@@ -1,7 +1,12 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { decodeVyzrRecommendation, parseVyzrScopes } from "./vyzrWorkspace.ts";
+import {
+  decodeVyzrRecommendation,
+  parseVyzrScopes,
+  shouldPollVyzrProjection,
+  vyzrWorkspaceQueryKey,
+} from "./vyzrWorkspace.ts";
 
 test("parses a bounded exact repository scope list", () => {
   assert.deepEqual(
@@ -35,5 +40,34 @@ test("decodes only a bounded recommendation whose byte count and digest match", 
   await assert.rejects(
     decodeVyzrRecommendation({ ...artifact, digest: "a".repeat(64) }),
     /digest/,
+  );
+});
+
+test("keys task state by relay, channel, repository, and immutable issue", () => {
+  const key = {
+    relayOrigin: "https://relay.example",
+    channelId: "project-channel",
+    repoAddress: "30617:owner:repo",
+  };
+  assert.deepEqual(vyzrWorkspaceQueryKey(key, "event-id"), [
+    "vyzr-task-workspace",
+    "https://relay.example",
+    "project-channel",
+    "30617:owner:repo",
+    "event-id",
+  ]);
+});
+
+test("polling stops after an error or terminal controller state", () => {
+  /** @type {any} */
+  const projection = { task: { state: "implementing" } };
+  assert.equal(shouldPollVyzrProjection(projection, false), true);
+  assert.equal(shouldPollVyzrProjection(projection, true), false);
+  assert.equal(
+    shouldPollVyzrProjection(
+      /** @type {any} */ ({ task: { state: "recommended" } }),
+      false,
+    ),
+    false,
   );
 });
