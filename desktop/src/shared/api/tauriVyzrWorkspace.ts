@@ -51,9 +51,16 @@ export type VyzrTaskWorkspaceProjection = {
   requestedReviewer: string;
   requestedChecks: string[];
   dataClass: string;
+  resourcePlan: VyzrResourcePlan;
   task: VyzrOperatorTask | null;
   events: VyzrControllerEvent[];
   recommendation: VyzrRecommendationArtifact | null;
+};
+
+export type VyzrResourcePlan = {
+  maxProviderExecutions: number;
+  correctionReserve: number;
+  independentReview: "exact_artifact_separate_session";
 };
 
 export type VyzrWorkspaceKey = {
@@ -95,11 +102,7 @@ export function submitVyzrProjectTask(input: {
   taskId: string;
   state: string;
   envelopeDigest: string;
-  resourcePlan: {
-    maxProviderExecutions: number;
-    correctionReserve: number;
-    independentReview: "exact_artifact_separate_session";
-  };
+  resourcePlan: VyzrResourcePlan;
   executionDriver: "scheduled" | "active" | "terminal";
 }> {
   return invokeTauri("submit_vyzr_project_task", { input });

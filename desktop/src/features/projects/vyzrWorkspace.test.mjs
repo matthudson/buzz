@@ -1,12 +1,35 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
+import { eventToProjectIssue } from "./projectIssues.mjs";
 import {
   decodeVyzrRecommendation,
   parseVyzrScopes,
+  resolveVyzrChannelId,
   shouldPollVyzrProjection,
   vyzrWorkspaceQueryKey,
 } from "./vyzrWorkspace.ts";
+
+test("uses the repository channel for native tasks without an issue h tag", () => {
+  const nativeIssue = eventToProjectIssue({
+    id: "e".repeat(64),
+    kind: 1621,
+    pubkey: "a".repeat(64),
+    created_at: 1,
+    content: "Bounded task",
+    tags: [["a", `30617:${"b".repeat(64)}:repo`]],
+  });
+  assert.equal(nativeIssue.channelId, null);
+  assert.equal(
+    resolveVyzrChannelId(nativeIssue.channelId, "repository-channel"),
+    "repository-channel",
+  );
+  assert.equal(
+    resolveVyzrChannelId("issue-channel", "repository-channel"),
+    "issue-channel",
+  );
+  assert.equal(resolveVyzrChannelId(null, null), "");
+});
 
 test("parses a bounded exact repository scope list", () => {
   assert.deepEqual(

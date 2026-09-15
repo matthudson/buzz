@@ -70,11 +70,18 @@ durable source of truth when Buzz is opened again.
 
 Buzz binds the immutable Nostr task event ID to its exact relay, project
 channel, and repository coordinate before deriving VYZR submission
-correlation. Submission is idempotent, and the resulting VYZR task ID is
-deterministic. Tool errors and non-exact admission receipts are rejected.
+correlation. A task's explicit `h` tag takes precedence; native Buzz tasks,
+which do not carry that tag, use the selected repository's signed channel
+binding. Submission is idempotent, and the resulting VYZR task ID is
+deterministic. Tool errors and non-exact admission receipts are rejected,
+including a resource plan that differs from the approved envelope. The shared
+provider-execution ceiling, correction reserve, and independent-review rule are
+shown in the task workspace.
 Transport or framing failures evict the affected cached client; fixed polling
 stops on an error instead of consuming an unbounded retry loop. The task detail
-polls only while work is active. Recommendation bytes are bounded and verified
+polls only while work is active. Event pages must be strictly ordered and end
+at the exact task projection checkpoint; concurrent drift fails closed and is
+retried only by a later ordinary UI refresh. Recommendation bytes are bounded and verified
 against their digest and byte count before display. When no bridge config is
 present, the task workspace renders nothing.
 

@@ -24,6 +24,13 @@ export function vyzrWorkspaceQueryKey(key: VyzrWorkspaceKey, issueId: string) {
   ] as const;
 }
 
+export function resolveVyzrChannelId(
+  issueChannelId: string | null | undefined,
+  repositoryChannelId: string | null | undefined,
+): string {
+  return issueChannelId?.trim() || repositoryChannelId?.trim() || "";
+}
+
 export function shouldPollVyzrProjection(
   projection: VyzrTaskWorkspaceProjection | undefined,
   failed: boolean,

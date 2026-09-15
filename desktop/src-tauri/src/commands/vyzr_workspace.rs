@@ -65,6 +65,8 @@ struct WorkspaceConfig {
     default_worker: String,
     default_reviewer: String,
     data_class: String,
+    #[serde(skip)]
+    resource_plan: Option<ResourcePlan>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -84,7 +86,7 @@ struct ProjectEnvelope {
     resource_plan: ResourcePlan,
 }
 
-#[derive(Clone, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ResourcePlan {
     max_provider_executions: u8,
@@ -188,6 +190,7 @@ pub struct VyzrWorkspaceProjection {
     requested_reviewer: String,
     requested_checks: Vec<String>,
     data_class: String,
+    resource_plan: ResourcePlan,
     task: Option<OperatorTask>,
     events: Vec<ControllerEvent>,
     recommendation: Option<Value>,
@@ -298,6 +301,13 @@ fn collect_runtime_files(
 fn runtime_tree_digest(root: &Path) -> Result<String, String> {
     let mut files = Vec::new();
     collect_runtime_files(root, root, &mut files)?;
+    files.sort_by_key(|path| {
+        path.strip_prefix(root)
+            .ok()
+            .and_then(Path::to_str)
+            .map(|relative| relative.replace('\\', "/"))
+            .unwrap_or_default()
+    });
     let mut total = 0_u64;
     let mut hasher = Sha256::new();
     for path in files {
@@ -447,6 +457,7 @@ fn validate_workspace(mut config: WorkspaceConfig) -> Result<WorkspaceConfig, St
     {
         return Err("vyzr_workspace_envelope_binding_mismatch".to_string());
     }
+    config.resource_plan = Some(envelope_value.resource_plan);
     config.node_executable = node.to_string_lossy().into_owned();
     config.runtime_root = runtime.to_string_lossy().into_owned();
     config.repository_path = repository.to_string_lossy().into_owned();
@@ -645,6 +656,31 @@ fn validate_controller_event(event: &ControllerEvent) -> Result<(), String> {
         || !safe_line(&event.observed_at, 64)
     {
         return Err("vyzr_workspace_events_invalid".to_string());
+    }
+    Ok(())
+}
+
+fn validate_event_snapshot(
+    events: &[ControllerEvent],
+    last_verified: &LastVerifiedUpdate,
+) -> Result<(), String> {
+    let mut prior_sequence = 0;
+    for event in events {
+        validate_controller_event(event)?;
+        if event.sequence <= prior_sequence || event.sequence > last_verified.sequence {
+            return Err("vyzr_workspace_events_snapshot_mismatch".to_string());
+        }
+        prior_sequence = event.sequence;
+    }
+    let final_event = events
+        .last()
+        .ok_or_else(|| "vyzr_workspace_events_snapshot_mismatch".to_string())?;
+    if final_event.sequence != last_verified.sequence
+        || final_event.revision != last_verified.revision
+        || final_event.kind != last_verified.kind
+        || final_event.observed_at != last_verified.observed_at
+    {
+        return Err("vyzr_workspace_events_snapshot_mismatch".to_string());
     }
     Ok(())
 }
@@ -958,9 +994,7 @@ pub async fn get_vyzr_project_task(
                     {
                         return Err("vyzr_workspace_events_invalid".to_string());
                     }
-                    for event in &page.events {
-                        validate_controller_event(event)?;
-                    }
+                    validate_event_snapshot(&page.events, &current.last_verified_update)?;
                     events = page.events;
                     if current.state == "recommended" {
                         let artifact = client
@@ -986,6 +1020,9 @@ pub async fn get_vyzr_project_task(
                     requested_reviewer: config.default_reviewer,
                     requested_checks: config.default_checks,
                     data_class: config.data_class,
+                    resource_plan: config
+                        .resource_plan
+                        .ok_or_else(|| "vyzr_workspace_envelope_binding_mismatch".to_string())?,
                     task,
                     events,
                     recommendation,
@@ -1000,6 +1037,7 @@ fn validate_submission_receipt(
     value: Value,
     expected_task_id: &str,
     expected_envelope_digest: &str,
+    expected_resource_plan: &ResourcePlan,
 ) -> Result<SubmissionReceipt, String> {
     let receipt: SubmissionReceipt = serde_json::from_value(value)
         .map_err(|_| "vyzr_workspace_submission_receipt_invalid".to_string())?;
@@ -1011,11 +1049,20 @@ fn validate_submission_receipt(
             receipt.execution_driver.as_str(),
             "scheduled" | "active" | "terminal"
         )
-        || !safe_identifier(&receipt.state, 64)
-        || receipt.resource_plan.max_provider_executions < 2
-        || receipt.resource_plan.max_provider_executions > 16
-        || receipt.resource_plan.correction_reserve > 3
-        || receipt.resource_plan.independent_review != "exact_artifact_separate_session"
+        || !matches!(
+            receipt.state.as_str(),
+            "starting"
+                | "implementing"
+                | "reviewing"
+                | "correcting"
+                | "reviewed"
+                | "rehearsed"
+                | "recommended"
+                | "needs_inspection"
+                | "integration_source_observed"
+                | "cancelled"
+        )
+        || receipt.resource_plan != *expected_resource_plan
     {
         return Err("vyzr_workspace_submission_receipt_invalid".to_string());
     }
@@ -1058,6 +1105,10 @@ pub async fn submit_vyzr_project_task(
                 )?;
                 let expected_task_id = task_id(&config, &input.issue_id)?;
                 let expected_envelope_digest = config.envelope_digest.clone();
+                let expected_resource_plan = config
+                    .resource_plan
+                    .clone()
+                    .ok_or_else(|| "vyzr_workspace_envelope_binding_mismatch".to_string())?;
                 let result = client
                     .transport
                     .tool(
@@ -1080,12 +1131,21 @@ pub async fn submit_vyzr_project_task(
                         }),
                     )
                     .await?;
-                validate_submission_receipt(result, &expected_task_id, &expected_envelope_digest)
+                validate_submission_receipt(
+                    result,
+                    &expected_task_id,
+                    &expected_envelope_digest,
+                    &expected_resource_plan,
+                )
             })
         },
     )
     .await
 }
+
+#[cfg(test)]
+#[path = "vyzr_workspace_extra_tests.rs"]
+mod extra_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1116,6 +1176,11 @@ mod tests {
             default_worker: "swe-2-direct".into(),
             default_reviewer: "codex-sol".into(),
             data_class: "INTERNAL".into(),
+            resource_plan: Some(ResourcePlan {
+                max_provider_executions: 4,
+                correction_reserve: 1,
+                independent_review: "exact_artifact_separate_session".into(),
+            }),
         }
     }
 
@@ -1236,14 +1301,37 @@ mod tests {
             valid_receipt(&config, &task),
             &task,
             &config.envelope_digest,
+            config.resource_plan.as_ref().unwrap(),
         )
         .is_ok());
         let mut wrong = valid_receipt(&config, &task);
         wrong["taskId"] = Value::String(format!("dev-{}", "2".repeat(64)));
-        assert!(validate_submission_receipt(wrong, &task, &config.envelope_digest).is_err());
+        assert!(validate_submission_receipt(
+            wrong,
+            &task,
+            &config.envelope_digest,
+            config.resource_plan.as_ref().unwrap()
+        )
+        .is_err());
         let mut unexpected = valid_receipt(&config, &task);
         unexpected["observedModel"] = Value::String("untrusted".into());
-        assert!(validate_submission_receipt(unexpected, &task, &config.envelope_digest).is_err());
+        assert!(validate_submission_receipt(
+            unexpected,
+            &task,
+            &config.envelope_digest,
+            config.resource_plan.as_ref().unwrap()
+        )
+        .is_err());
+
+        let mut wrong_plan = valid_receipt(&config, &task);
+        wrong_plan["resourcePlan"]["maxProviderExecutions"] = json!(5);
+        assert!(validate_submission_receipt(
+            wrong_plan,
+            &task,
+            &config.envelope_digest,
+            config.resource_plan.as_ref().unwrap()
+        )
+        .is_err());
     }
 
     #[test]

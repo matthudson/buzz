@@ -7,6 +7,7 @@ import type { ProjectIssue, Repository } from "@/features/projects/hooks";
 import {
   decodeVyzrRecommendation,
   parseVyzrScopes,
+  resolveVyzrChannelId,
   shouldPollVyzrProjection,
   vyzrWorkspaceQueryKey,
 } from "@/features/projects/vyzrWorkspace";
@@ -82,7 +83,7 @@ export function VyzrTaskWorkspacePanel({
 }) {
   const queryClient = useQueryClient();
   const relayOrigin = useRelayOrigin();
-  const channelId = issue.channelId ?? "";
+  const channelId = resolveVyzrChannelId(issue.channelId, project.channelId);
   const issueRepoAddress = issue.repoAddress ?? "";
   const workspaceKey = React.useMemo(
     () => ({
@@ -93,9 +94,13 @@ export function VyzrTaskWorkspacePanel({
     [channelId, project.repoAddress, relayOrigin],
   );
   const [scopeInput, setScopeInput] = React.useState("");
+  const [scopeError, setScopeError] = React.useState<string | null>(null);
   const scopeResetKey = `${relayOrigin ?? ""}\n${channelId}\n${project.repoAddress}\n${issue.id}`;
   React.useEffect(() => {
-    if (scopeResetKey) setScopeInput("");
+    if (scopeResetKey) {
+      setScopeInput("");
+      setScopeError(null);
+    }
   }, [scopeResetKey]);
   const availability = useQuery({
     queryKey: [
@@ -146,6 +151,27 @@ export function VyzrTaskWorkspacePanel({
       );
     },
   });
+  const submitCurrentScope = () => {
+    let scopes: string[];
+    try {
+      scopes = parseVyzrScopes(scopeInput);
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : "The source scope is invalid.";
+      setScopeError(message);
+      toast.error(message);
+      return;
+    }
+    setScopeError(null);
+    submit.mutate({
+      ...workspaceKey,
+      issueRepoAddress,
+      issueId: issue.id,
+      title: issue.title,
+      objective: issue.content.trim() || issue.title,
+      scopes,
+    });
+  };
 
   if (!relayOrigin || !channelId || issueRepoAddress !== project.repoAddress) {
     return null;
@@ -203,6 +229,10 @@ export function VyzrTaskWorkspacePanel({
           <div className="rounded-lg border border-border/60 bg-muted/20 px-3 py-2 text-xs text-muted-foreground">
             Requested route: {data.requestedWorker} → {data.requestedReviewer} ·{" "}
             {data.requestedChecks.join(", ")} · {data.dataClass}
+            <br />
+            Shared task budget: {data.resourcePlan.maxProviderExecutions}{" "}
+            provider executions, including {data.resourcePlan.correctionReserve}{" "}
+            reserved for correction · independent exact-artifact review
           </div>
           <label
             className="block space-y-1.5 text-sm font-medium"
@@ -213,24 +243,31 @@ export function VyzrTaskWorkspacePanel({
               data-testid="vyzr-workspace-scopes"
               disabled={submit.isPending}
               id="vyzr-workspace-scopes"
-              onChange={(event) => setScopeInput(event.target.value)}
+              aria-describedby={
+                scopeError ? "vyzr-workspace-scope-error" : undefined
+              }
+              aria-invalid={scopeError ? "true" : undefined}
+              onChange={(event) => {
+                setScopeInput(event.target.value);
+                setScopeError(null);
+              }}
               placeholder="docs/guide.md, packages/domain/src"
               value={scopeInput}
             />
           </label>
+          {scopeError ? (
+            <p
+              aria-live="polite"
+              className="text-xs text-destructive"
+              id="vyzr-workspace-scope-error"
+            >
+              {scopeError}
+            </p>
+          ) : null}
           <Button
             data-testid="vyzr-workspace-submit"
             disabled={submit.isPending || scopeInput.trim().length === 0}
-            onClick={() =>
-              submit.mutate({
-                ...workspaceKey,
-                issueRepoAddress,
-                issueId: issue.id,
-                title: issue.title,
-                objective: issue.content.trim() || issue.title,
-                scopes: parseVyzrScopes(scopeInput),
-              })
-            }
+            onClick={submitCurrentScope}
             type="button"
           >
             {submit.isPending ? "Submitting…" : "Start with VYZR"}
@@ -253,6 +290,11 @@ export function VyzrTaskWorkspacePanel({
           </ProjectDetailMetaRow>
           <ProjectDetailMetaRow icon={Route} label="Requested route">
             {data.requestedWorker} → {data.requestedReviewer}
+          </ProjectDetailMetaRow>
+          <ProjectDetailMetaRow icon={ShieldCheck} label="Shared task budget">
+            {data.resourcePlan.maxProviderExecutions} executions ·{" "}
+            {data.resourcePlan.correctionReserve} correction reserve ·
+            exact-artifact review
           </ProjectDetailMetaRow>
           <ProjectDetailMetaRow icon={Clock3} label="Last verified">
             <span

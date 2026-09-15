@@ -387,7 +387,7 @@ export function ProjectIssueDetail({
       ) : null}
       <VyzrTaskWorkspacePanel
         issue={issue}
-        key={`${project.repoAddress}:${issue.channelId ?? "unknown"}:${issue.id}`}
+        key={`${project.repoAddress}:${issue.channelId ?? project.channelId ?? "unknown"}:${issue.id}`}
         project={project}
       />
       <ProjectDetailSection defaultOpen title="Activity">
