@@ -76,7 +76,8 @@ durable source of truth when Buzz is opened again.
 
 Buzz binds the immutable Nostr task event ID to its exact relay, project
 channel, and repository coordinate before deriving VYZR submission
-correlation. A task's explicit `h` tag is used byte-for-byte and must pass the
+correlation. A task's explicit `h` tag is used byte-for-byte; an empty or
+malformed present tag fails closed, and a valid value must pass the
 backend's exact identifier validation; it is never trimmed or normalized.
 Native Buzz tasks,
 which do not carry that tag, use the selected repository's signed channel

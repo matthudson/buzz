@@ -34,6 +34,22 @@ test("uses the repository channel for native tasks without an issue h tag", () =
     "issue-channel ",
   );
   assert.equal(resolveVyzrChannelId(null, null), "");
+
+  for (const malformedTag of [["h", ""], ["h"]]) {
+    const malformedIssue = eventToProjectIssue({
+      id: "f".repeat(64),
+      kind: 1621,
+      pubkey: "a".repeat(64),
+      created_at: 1,
+      content: "Malformed binding",
+      tags: [["a", `30617:${"b".repeat(64)}:repo`], malformedTag],
+    });
+    assert.equal(malformedIssue.channelId, "");
+    assert.equal(
+      resolveVyzrChannelId(malformedIssue.channelId, "repository-channel"),
+      "",
+    );
+  }
 });
 
 test("parses a bounded exact repository scope list", () => {

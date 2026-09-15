@@ -173,6 +173,21 @@ export function VyzrTaskWorkspacePanel({
     });
   };
 
+  if (issue.channelId !== null && channelId.length === 0) {
+    return (
+      <ProjectDetailSection defaultOpen title="VYZR delivery">
+        <div
+          aria-live="polite"
+          className="flex gap-2 text-sm text-muted-foreground"
+        >
+          <CircleAlert aria-hidden="true" className="mt-0.5 h-4 w-4 shrink-0" />
+          <span>
+            The signed task channel binding is malformed. No task was submitted.
+          </span>
+        </div>
+      </ProjectDetailSection>
+    );
+  }
   if (!relayOrigin || !channelId || issueRepoAddress !== project.repoAddress) {
     return null;
   }

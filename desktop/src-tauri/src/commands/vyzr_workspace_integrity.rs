@@ -29,7 +29,7 @@ pub(super) fn count_runtime_entry(entries_seen: &mut usize) -> Result<(), String
     Ok(())
 }
 
-fn collect_runtime_files(
+pub(super) fn collect_runtime_files(
     root: &Path,
     directory: &Path,
     files: &mut Vec<PathBuf>,

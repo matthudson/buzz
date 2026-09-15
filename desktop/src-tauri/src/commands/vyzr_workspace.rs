@@ -21,7 +21,9 @@ use tokio::time::{timeout, Duration};
 
 #[path = "vyzr_workspace_integrity.rs"]
 mod integrity;
-use integrity::{count_runtime_entry, read_bounded_file, runtime_tree_digest};
+#[cfg(test)]
+use integrity::{collect_runtime_files, count_runtime_entry};
+use integrity::{read_bounded_file, runtime_tree_digest};
 
 const CONFIG_ENV: &str = "BUZZ_VYZR_WORKSPACE_CONFIG";
 const MAX_CONFIG_BYTES: u64 = 64 * 1024;
@@ -840,26 +842,37 @@ where
         load_workspace_config(relay_origin, channel_id, repo_address)?;
     let client_key = format!("{relay_origin}\n{channel_id}\n{repo_address}");
     let mut clients = state.clients.lock().await;
-    if let Some(existing) = clients.get(&client_key) {
-        if existing.transport.config_digest != config_digest {
-            return Err("vyzr_workspace_configuration_changed_restart_required".to_string());
-        }
+    let operation_config = if let Some(existing) = clients.get(&client_key) {
+        cached_operation_config(
+            &existing.transport.config_digest,
+            &config_digest,
+            &existing.config,
+        )?
     } else {
         let config = validate_workspace(unvalidated_config)?;
         let client = VyzrMcpClient::launch(&config, config_digest).await?;
         clients.insert(client_key.clone(), client);
-    }
+        config
+    };
     let result = match clients.get_mut(&client_key) {
-        Some(client) => {
-            let config = client.config.clone();
-            operation(client, config).await
-        }
+        Some(client) => operation(client, operation_config).await,
         None => Err("vyzr_workspace_client_unavailable".to_string()),
     };
     if result.is_err() {
         clients.remove(&client_key);
     }
     result
+}
+
+fn cached_operation_config(
+    cached_digest: &str,
+    current_digest: &str,
+    cached_config: &WorkspaceConfig,
+) -> Result<WorkspaceConfig, String> {
+    if cached_digest != current_digest {
+        return Err("vyzr_workspace_configuration_changed_restart_required".to_string());
+    }
+    Ok(cached_config.clone())
 }
 
 /// Reports whether an exact relay/channel/repository mapping is configured.
