@@ -19,11 +19,18 @@ use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 use tokio::time::{timeout, Duration};
 
+#[path = "vyzr_workspace_integrity.rs"]
+mod integrity;
+use integrity::{count_runtime_entry, read_bounded_file, runtime_tree_digest};
+
 const CONFIG_ENV: &str = "BUZZ_VYZR_WORKSPACE_CONFIG";
 const MAX_CONFIG_BYTES: u64 = 64 * 1024;
+const MAX_ENVELOPE_BYTES: u64 = 256 * 1024;
 const MAX_RPC_BYTES: usize = 512 * 1024;
 const RPC_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_RUNTIME_FILES: usize = 10_000;
+const MAX_RUNTIME_ENTRIES: usize = 10_000;
+const MAX_RUNTIME_DEPTH: usize = 64;
 const MAX_RUNTIME_BYTES: u64 = 512 * 1024 * 1024;
 
 /// Process-local cache of validated VYZR MCP connections.
@@ -227,6 +234,7 @@ type McpWriter = Box<dyn AsyncWrite + Send + Unpin>;
 struct VyzrMcpClient {
     _child: Child,
     transport: McpTransport,
+    config: WorkspaceConfig,
 }
 
 struct McpTransport {
@@ -253,86 +261,6 @@ fn sha256_file(path: &Path) -> Result<String, String> {
             break;
         }
         hasher.update(&buffer[..count]);
-    }
-    Ok(hex::encode(hasher.finalize()))
-}
-
-fn collect_runtime_files(
-    root: &Path,
-    directory: &Path,
-    files: &mut Vec<PathBuf>,
-) -> Result<(), String> {
-    let mut entries = std::fs::read_dir(directory)
-        .map_err(|_| "vyzr_workspace_runtime_unavailable".to_string())?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|_| "vyzr_workspace_runtime_unavailable".to_string())?;
-    entries.sort_by_key(|entry| entry.file_name());
-    for entry in entries {
-        let path = entry.path();
-        let relative = path
-            .strip_prefix(root)
-            .map_err(|_| "vyzr_workspace_runtime_unsafe".to_string())?;
-        if relative
-            .components()
-            .next()
-            .is_some_and(|part| part.as_os_str() == ".git")
-        {
-            continue;
-        }
-        let metadata = std::fs::symlink_metadata(&path)
-            .map_err(|_| "vyzr_workspace_runtime_unavailable".to_string())?;
-        if metadata.file_type().is_symlink() {
-            return Err("vyzr_workspace_runtime_unsafe".to_string());
-        }
-        if metadata.is_dir() {
-            collect_runtime_files(root, &path, files)?;
-        } else if metadata.is_file() {
-            files.push(path);
-            if files.len() > MAX_RUNTIME_FILES {
-                return Err("vyzr_workspace_runtime_unsafe".to_string());
-            }
-        } else {
-            return Err("vyzr_workspace_runtime_unsafe".to_string());
-        }
-    }
-    Ok(())
-}
-
-fn runtime_tree_digest(root: &Path) -> Result<String, String> {
-    let mut files = Vec::new();
-    collect_runtime_files(root, root, &mut files)?;
-    files.sort_by_key(|path| {
-        path.strip_prefix(root)
-            .ok()
-            .and_then(Path::to_str)
-            .map(|relative| relative.replace('\\', "/"))
-            .unwrap_or_default()
-    });
-    let mut total = 0_u64;
-    let mut hasher = Sha256::new();
-    for path in files {
-        let relative = path
-            .strip_prefix(root)
-            .map_err(|_| "vyzr_workspace_runtime_unsafe".to_string())?
-            .to_str()
-            .ok_or_else(|| "vyzr_workspace_runtime_unsafe".to_string())?
-            .replace('\\', "/");
-        let metadata = std::fs::metadata(&path)
-            .map_err(|_| "vyzr_workspace_runtime_unavailable".to_string())?;
-        total = total
-            .checked_add(metadata.len())
-            .filter(|value| *value <= MAX_RUNTIME_BYTES)
-            .ok_or_else(|| "vyzr_workspace_runtime_unsafe".to_string())?;
-        let bytes =
-            std::fs::read(&path).map_err(|_| "vyzr_workspace_runtime_unavailable".to_string())?;
-        if bytes.len() as u64 != metadata.len() {
-            return Err("vyzr_workspace_runtime_changed".to_string());
-        }
-        hasher.update(relative.as_bytes());
-        hasher.update([0]);
-        hasher.update(bytes.len().to_string().as_bytes());
-        hasher.update([0]);
-        hasher.update(bytes);
     }
     Ok(hex::encode(hasher.finalize()))
 }
@@ -443,10 +371,13 @@ fn validate_workspace(mut config: WorkspaceConfig) -> Result<WorkspaceConfig, St
     if sha256_file(&codex)? != config.codex_sha256 || sha256_file(&devin)? != config.devin_sha256 {
         return Err("vyzr_workspace_provider_integrity_mismatch".to_string());
     }
-    let envelope_value: ProjectEnvelope = serde_json::from_slice(
-        &std::fs::read(&envelope).map_err(|_| "vyzr_workspace_envelope_unavailable".to_string())?,
-    )
-    .map_err(|_| "vyzr_workspace_envelope_invalid".to_string())?;
+    let envelope_bytes = read_bounded_file(
+        &envelope,
+        MAX_ENVELOPE_BYTES,
+        "vyzr_workspace_envelope_unavailable",
+    )?;
+    let envelope_value: ProjectEnvelope = serde_json::from_slice(&envelope_bytes)
+        .map_err(|_| "vyzr_workspace_envelope_invalid".to_string())?;
     let canonical_envelope = serde_json::to_vec(&envelope_value)
         .map_err(|_| "vyzr_workspace_envelope_invalid".to_string())?;
     if sha256_bytes(&canonical_envelope) != config.envelope_digest
@@ -468,7 +399,7 @@ fn validate_workspace(mut config: WorkspaceConfig) -> Result<WorkspaceConfig, St
     Ok(config)
 }
 
-fn load_workspace(
+fn load_workspace_config(
     relay_origin: &str,
     channel_id: &str,
     repo_address: &str,
@@ -516,8 +447,16 @@ fn load_workspace(
         .into_iter()
         .next()
         .ok_or_else(|| "vyzr_workspace_mapping_unavailable".to_string())?;
-    let workspace = validate_workspace(workspace)?;
     Ok((workspace, sha256_bytes(&bytes)))
+}
+
+fn load_validated_workspace(
+    relay_origin: &str,
+    channel_id: &str,
+    repo_address: &str,
+) -> Result<(WorkspaceConfig, String), String> {
+    let (workspace, digest) = load_workspace_config(relay_origin, channel_id, repo_address)?;
+    Ok((validate_workspace(workspace)?, digest))
 }
 
 fn issue_submission_id(
@@ -736,6 +675,7 @@ impl VyzrMcpClient {
                 next_id: 1,
                 config_digest,
             },
+            config: config.clone(),
         };
         let initialized = client
             .transport.request("initialize", json!({
@@ -896,7 +836,8 @@ where
         WorkspaceConfig,
     ) -> Pin<Box<dyn Future<Output = Result<T, String>> + Send + 'a>>,
 {
-    let (config, config_digest) = load_workspace(relay_origin, channel_id, repo_address)?;
+    let (unvalidated_config, config_digest) =
+        load_workspace_config(relay_origin, channel_id, repo_address)?;
     let client_key = format!("{relay_origin}\n{channel_id}\n{repo_address}");
     let mut clients = state.clients.lock().await;
     if let Some(existing) = clients.get(&client_key) {
@@ -904,11 +845,15 @@ where
             return Err("vyzr_workspace_configuration_changed_restart_required".to_string());
         }
     } else {
+        let config = validate_workspace(unvalidated_config)?;
         let client = VyzrMcpClient::launch(&config, config_digest).await?;
         clients.insert(client_key.clone(), client);
     }
     let result = match clients.get_mut(&client_key) {
-        Some(client) => operation(client, config).await,
+        Some(client) => {
+            let config = client.config.clone();
+            operation(client, config).await
+        }
         None => Err("vyzr_workspace_client_unavailable".to_string()),
     };
     if result.is_err() {
@@ -927,7 +872,7 @@ pub async fn is_vyzr_workspace_available(
     if std::env::var_os(CONFIG_ENV).is_none() {
         return Ok(VyzrWorkspaceAvailability { configured: false });
     }
-    load_workspace(&relay_origin, &channel_id, &repo_address)?;
+    load_validated_workspace(&relay_origin, &channel_id, &repo_address)?;
     Ok(VyzrWorkspaceAvailability { configured: true })
 }
 

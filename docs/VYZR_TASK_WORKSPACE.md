@@ -52,14 +52,20 @@ and canonicalizes its executable/runtime paths, binds the canonical envelope
 digest and the envelope's project, principal, and runtime revision, and
 launches the pinned VYZR MCP from that approved runtime. The bounded runtime
 tree digest covers every ordinary file below the runtime root except `.git`;
-symlinks, special files, more than 10,000 files, or more than 512 MiB fail
-closed. Files are sorted by relative path and hashed as repeated UTF-8
+symlinks, special files, more than 10,000 total entries, depth beyond 64, or
+more than 512 MiB fail closed. Files are sorted by relative path and hashed as repeated UTF-8
 forward-slash path, NUL, decimal byte length, NUL, and exact file bytes. Node,
 Codex, and Devin are separately bound by SHA-256. Validation is
 repeated immediately before process creation. The configuration digest is
 fixed for the child lifetime; drift requires an app restart rather than
 silently changing authority. The UI may request source scope, but VYZR's
 server-owned envelope makes the acceptance decision.
+
+Full runtime, envelope (bounded to 256 KiB), and provider validation occurs
+when a controller client is created and again at the final practical point
+before its process is spawned. Active status polling reads only the bounded
+configuration bytes and compares their digest with the client binding; it does
+not synchronously rehash the complete runtime tree every five seconds.
 
 If Buzz exits while an admitted execution is active, closing MCP input makes
 the existing VYZR driver stop accepting work, wait for its already-admitted
@@ -70,7 +76,9 @@ durable source of truth when Buzz is opened again.
 
 Buzz binds the immutable Nostr task event ID to its exact relay, project
 channel, and repository coordinate before deriving VYZR submission
-correlation. A task's explicit `h` tag takes precedence; native Buzz tasks,
+correlation. A task's explicit `h` tag is used byte-for-byte and must pass the
+backend's exact identifier validation; it is never trimmed or normalized.
+Native Buzz tasks,
 which do not carry that tag, use the selected repository's signed channel
 binding. Submission is idempotent, and the resulting VYZR task ID is
 deterministic. Tool errors and non-exact admission receipts are rejected,

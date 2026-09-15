@@ -28,6 +28,11 @@ test("uses the repository channel for native tasks without an issue h tag", () =
     resolveVyzrChannelId("issue-channel", "repository-channel"),
     "issue-channel",
   );
+  assert.equal(resolveVyzrChannelId("   ", "repository-channel"), "   ");
+  assert.equal(
+    resolveVyzrChannelId("issue-channel ", "repository-channel"),
+    "issue-channel ",
+  );
   assert.equal(resolveVyzrChannelId(null, null), "");
 });
 

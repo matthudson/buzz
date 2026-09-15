@@ -57,3 +57,21 @@ fn event_page_must_end_at_the_exact_projected_checkpoint() {
     let duplicated = vec![valid[1].clone(), valid[1].clone()];
     assert!(validate_event_snapshot(&duplicated, &checkpoint).is_err());
 }
+
+#[test]
+fn runtime_traversal_bounds_entries_depth_and_bounded_file_reads() {
+    let mut entries = MAX_RUNTIME_ENTRIES;
+    assert!(count_runtime_entry(&mut entries).is_err());
+
+    let root = tempfile::tempdir().unwrap();
+    let mut nested = root.path().to_path_buf();
+    for _ in 0..=MAX_RUNTIME_DEPTH {
+        nested.push("d");
+        std::fs::create_dir(&nested).unwrap();
+    }
+    assert!(runtime_tree_digest(root.path()).is_err());
+
+    let bounded = root.path().join("bounded.json");
+    std::fs::write(&bounded, b"123456789").unwrap();
+    assert!(read_bounded_file(&bounded, 8, "bounded").is_err());
+}

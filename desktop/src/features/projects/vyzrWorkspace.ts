@@ -28,7 +28,9 @@ export function resolveVyzrChannelId(
   issueChannelId: string | null | undefined,
   repositoryChannelId: string | null | undefined,
 ): string {
-  return issueChannelId?.trim() || repositoryChannelId?.trim() || "";
+  return issueChannelId === null || issueChannelId === undefined
+    ? (repositoryChannelId ?? "")
+    : issueChannelId;
 }
 
 export function shouldPollVyzrProjection(
