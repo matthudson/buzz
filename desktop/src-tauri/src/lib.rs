@@ -234,6 +234,7 @@ pub fn run() {
         .manage(native_relay_client::NativeRelayClient::default())
         .manage(observed_unread::ObservedUnreadStore::default())
         .manage(channel_head_cache::ChannelHeadCacheStore::default())
+        .manage(VyzrWorkspaceState::default())
         .setup(move |app| {
             let app_handle = app.handle().clone();
             #[cfg(target_os = "macos")]
@@ -589,6 +590,8 @@ pub fn run() {
             merge_project_pull_request,
             open_project_terminal,
             open_project_merge_recovery_terminal,
+            get_vyzr_project_task,
+            submit_vyzr_project_task,
             search_users,
             get_presence,
             get_os_idle_seconds,

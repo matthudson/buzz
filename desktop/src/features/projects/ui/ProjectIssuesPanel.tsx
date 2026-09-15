@@ -57,6 +57,7 @@ import {
 import { ProjectWorkItemGroup } from "./ProjectWorkItemGroup";
 import { ProjectWorkItemRow } from "./ProjectWorkItemRow";
 import { ProjectPanelState } from "./ProjectPanelState";
+import { VyzrTaskWorkspacePanel } from "./VyzrTaskWorkspacePanel";
 
 export function issueStatusClassName(status: ProjectIssue["status"]) {
   if (status === "Triage" || status === "In Progress") return "text-amber-500";
@@ -384,6 +385,7 @@ export function ProjectIssueDetail({
           <ProjectRichContent content={issue.content} tags={issue.tags} />
         </ProjectDetailSection>
       ) : null}
+      <VyzrTaskWorkspacePanel issue={issue} project={project} />
       <ProjectDetailSection defaultOpen title="Activity">
         <div className="space-y-3">
           <DiscussedInChannels
