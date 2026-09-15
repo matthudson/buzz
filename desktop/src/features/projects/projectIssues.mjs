@@ -183,6 +183,7 @@ export function eventToProjectIssue(
   statusEvents = [],
   commentEvents = [],
 ) {
+  const channelTag = issue.tags.find((tag) => tag[0] === "h");
   const latestStatus = latestStatusForIssue(issue, statusEvents);
   const issueCommentEvents = commentEvents.filter((event) =>
     event.tags.some(
@@ -203,7 +204,11 @@ export function eventToProjectIssue(
     author: issue.pubkey,
     createdAt: issue.created_at,
     repoAddress: getTag(issue, "a") ?? null,
-    channelId: getTag(issue, "h") ?? null,
+    channelId: channelTag
+      ? typeof channelTag[1] === "string"
+        ? channelTag[1]
+        : ""
+      : null,
     originAgentName: getTag(issue, "buzz-origin-agent") ?? null,
     labels,
     category: projectTaskCategoryFromLabels(labels),
